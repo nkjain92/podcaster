@@ -7,6 +7,10 @@ import logging
 from tqdm import tqdm
 import ssl
 import certifi
+from dotenv import load_dotenv  # Import dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 try:
     from deepgram import Deepgram
@@ -23,7 +27,7 @@ logging.basicConfig(
 )
 
 # Constants
-DEEPGRAM_API_KEY = "2fbf9013438ec252747a34e58ae346442b7cafbb"
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PODCASTS_DIR = "/Users/nishankjain/projects/podcaster/podcasts"
 TRANSCRIPTIONS_DIR = "transcriptions"
 MIME_TYPE = "audio/mp3"
