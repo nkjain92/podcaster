@@ -2,10 +2,6 @@
 /podcasts/
 *.mp3
 
-# Transcription files
-/transcriptions/
-*.json
-
 # Logs
 *.log
 
