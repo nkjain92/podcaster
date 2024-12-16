@@ -1,10 +1,11 @@
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import json
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 import tiktoken
 from datetime import datetime
+import asyncio
 
 from .founder_types import *
 
@@ -16,7 +17,10 @@ if not api_key:
     raise ValueError("OPENAI_API_KEY not found in environment variables")
 
 client = OpenAI(api_key=api_key)
-encoding = tiktoken.encoding_for_model("gpt-4-0125-preview")
+encoding = tiktoken.get_encoding("cl100k_base")
+
+# Initialize async client
+async_client = AsyncOpenAI(api_key=api_key)
 
 def count_tokens(text: str) -> int:
     """Count tokens in text"""
@@ -54,17 +58,27 @@ def extract_with_retries(prompt: str, max_retries: int = 3) -> Dict:
         try:
             print(f"Making API call (attempt {attempt + 1}/{max_retries})...")
             response = client.chat.completions.create(
-                model="gpt-4-0125-preview",
+                model="o1-preview-2024-09-12",
                 messages=[{
                     "role": "user",
-                    "content": f"{prompt}\n\nRespond in valid JSON format."
-                }],
-                temperature=0,
-                response_format={"type": "json_object"}
+                    "content": "You must respond with pure JSON only, no markdown, no explanations, no code blocks.\n\n" + prompt
+                }]
             )
             elapsed = (datetime.now() - start_time).total_seconds()
             print(f"API call successful (took {elapsed:.1f}s)")
-            return json.loads(response.choices[0].message.content)
+
+            # Check if response is not empty
+            content = response.choices[0].message.content.strip()
+            if not content:
+                raise ValueError("Empty response from API")
+
+            print(f"Raw response content: {content}")
+
+            # Remove any potential markdown or code block formatting
+            if content.startswith("```"):
+                content = "\n".join(content.split("\n")[1:-1])
+
+            return json.loads(content)
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
             print(f"API call failed after {elapsed:.1f}s: {e}")
@@ -72,10 +86,68 @@ def extract_with_retries(prompt: str, max_retries: int = 3) -> Dict:
                 raise e
             continue
 
+async def extract_with_retries_async(prompt: str, extraction_type: str, max_retries: int = 3) -> Tuple[str, Dict]:
+    """Async version of extract_with_retries"""
+    start_time = datetime.now()
+
+    for attempt in range(max_retries):
+        try:
+            print(f"Making API call for {extraction_type} (attempt {attempt + 1}/{max_retries})...")
+            response = await async_client.chat.completions.create(
+                model="o1-preview-2024-09-12",
+                messages=[{
+                    "role": "user",
+                    "content": "You must respond with pure JSON only, no markdown, no explanations, no code blocks.\n\n" + prompt
+                }]
+            )
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"API call for {extraction_type} successful (took {elapsed:.1f}s)")
+
+            # Check if response is not empty
+            content = response.choices[0].message.content.strip()
+            if not content:
+                raise ValueError("Empty response from API")
+
+            print(f"Raw response content for {extraction_type}: {content}")
+
+            # Remove any potential markdown or code block formatting
+            if content.startswith("```"):
+                content = "\n".join(content.split("\n")[1:-1])
+
+            return extraction_type, json.loads(content)
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"API call for {extraction_type} failed after {elapsed:.1f}s: {e}")
+            if attempt == max_retries - 1:
+                raise e
+            continue
+
+async def extract_all_components(transcript: str) -> Dict[str, Any]:
+    """Extract all components in parallel"""
+    tasks = [
+        extract_with_retries_async(extract_traits.__doc__, "traits"),
+        extract_with_retries_async(extract_beliefs.__doc__, "beliefs"),
+        extract_with_retries_async(extract_philosophies.__doc__, "philosophies"),
+        extract_with_retries_async(extract_failures.__doc__, "failures"),
+        extract_with_retries_async(extract_key_decisions.__doc__, "key_decisions"),
+        extract_with_retries_async(extract_mentors_and_network.__doc__, "mentors"),
+        extract_with_retries_async(extract_habits.__doc__, "habits"),
+        extract_with_retries_async(extract_unique_approaches.__doc__, "approaches"),
+        extract_with_retries_async(extract_anecdotes.__doc__, "anecdotes"),
+        extract_with_retries_async(extract_emotional_intelligence.__doc__, "emotional_intelligence")
+    ]
+
+    results = {}
+    for task in asyncio.as_completed(tasks):
+        extraction_type, data = await task
+        results[extraction_type] = data
+
+    return results
+
 def extract_basic_info(transcript: str) -> BasicInfo:
     """Extract basic info about founder from transcript"""
-    prompt = f"""Analyze this transcript and extract basic information about the founder.
-    Return a JSON object in this exact format:
+    prompt = f"""You must respond with ONLY a JSON object, no markdown formatting, no explanations, no code blocks.
+    The JSON must exactly match this schema:
     {{
       "name": "string",
       "domain": ["string", ...],
@@ -86,10 +158,8 @@ def extract_basic_info(transcript: str) -> BasicInfo:
       }}
     }}
 
-    - If an item is not found, return null or an empty list as appropriate.
-    - If era end date is unknown, set it to null.
-
-    Transcript excerpt: {transcript[:2000]}...
+    Analyze this transcript and extract basic information about the founder:
+    {transcript[:2000]}...
     """
 
     result = extract_with_retries(prompt)
@@ -188,81 +258,42 @@ def extract_timeline(transcript: str) -> List[TimelineEvent]:
 def extract_traits(transcript: str) -> List[Trait]:
     """Extract personality traits and skills"""
     prompt = f"""Analyze this transcript and identify key personality traits and skills.
-    Return a JSON object with a "traits" array in this format:
-    {
+    Return a JSON object in this exact format:
+    {{
       "traits": [
-        {
-          "trait": "Name of trait/skill",
-          "category": "TRAIT or SKILL",
-          "origin": "INNATE or DEVELOPED",
-          "description": "Detailed description",
+        {{
+          "trait": "string",
+          "category": "TRAIT|SKILL",
+          "origin": "INNATE|DEVELOPED",
+          "description": "string",
           "examples": [
-            {
-              "description": "Specific example from transcript",
-              "source": "Quote from transcript"
-            }
+            {{
+              "description": "string",
+              "source": "string"
+            }}
           ],
           "evolution": [
-            {
-              "period": "Time period",
-              "change": "How trait changed",
-              "trigger": "What caused the change"
-            }
+            {{
+              "period": "string",
+              "change": "string",
+              "trigger": "string or null"
+            }}
           ],
           "blind_spots": [
-            {
-              "description": "Description of weakness",
-              "overcome_strategy": "How they dealt with it",
-              "source": "Quote from transcript",
-              "confidence": 0.8,
-              "data_type": "FACTUAL"
-            }
+            {{
+              "description": "string",
+              "overcome_strategy": "string or null",
+              "source": "string",
+              "confidence": number between 0 and 1,
+              "data_type": "FACTUAL|SPECULATIVE|INFERRED"
+            }}
           ],
-          "source": "Quote from transcript",
-          "confidence": 0.9,
-          "data_type": "FACTUAL"
-        }
+          "source": "string",
+          "confidence": number between 0 and 1,
+          "data_type": "FACTUAL|SPECULATIVE|INFERRED"
+        }}
       ]
-    }
-
-    Example response:
-    {
-      "traits": [
-        {
-          "trait": "Relentless Drive",
-          "category": "TRAIT",
-          "origin": "INNATE",
-          "description": "Extraordinary determination and work ethic",
-          "examples": [
-            {
-              "description": "Working 100-hour weeks at Zip2",
-              "source": "The transcript mentions: 'Musk would sleep at the office, working around the clock to build the company.'"
-            }
-          ],
-          "evolution": [
-            {
-              "period": "1995-1999",
-              "change": "Intensified during early startup days",
-              "trigger": "Pressure to succeed with limited resources"
-            }
-          ],
-          "blind_spots": [
-            {
-              "description": "Work-life balance issues",
-              "overcome_strategy": "Learned to delegate more effectively",
-              "source": "As noted: 'Musk eventually learned to trust his team more'",
-              "confidence": 0.8,
-              "data_type": "FACTUAL"
-            }
-          ],
-          "source": "Multiple references throughout the transcript",
-          "confidence": 0.9,
-          "data_type": "FACTUAL"
-        }
-      ]
-    }
-
-    Transcript: {transcript}
+    }}
     """
 
     result = extract_with_retries(prompt)
@@ -913,6 +944,7 @@ def extract_emotional_intelligence(transcript: str) -> EmotionalIntelligence:
 
 def extract_founder_data(transcript: str) -> Founder:
     """Extract all founder data from transcript"""
+    results = {}  # Initialize results at the start
     try:
         print("\n=== Starting Founder Data Extraction ===")
 
@@ -921,7 +953,7 @@ def extract_founder_data(transcript: str) -> Founder:
         chunks = chunk_transcript(transcript)
         print(f"Split into {len(chunks)} chunks")
 
-        # Extract basic info from first chunk
+        # Extract basic info from first chunk (keep this sequential)
         print("\nExtracting basic info...")
         basic_info = extract_basic_info(chunks[0])
         print(f"Found basic info for: {basic_info.name}")
@@ -939,112 +971,69 @@ def extract_founder_data(transcript: str) -> Founder:
                 print(f"Warning: Error extracting timeline from chunk {i}: {e}")
 
         # Sort and deduplicate timeline events
-        print(f"\nDeduplicating {len(all_timeline_events)} total events...")
         timeline = sorted(set(all_timeline_events), key=lambda x: x.date)
-        print(f"Final timeline has {len(timeline)} unique events")
 
-        # Extract other components with error handling
-        print("\nExtracting additional components...")
+        # Extract all other components in parallel
+        print("\nExtracting additional components in parallel...")
+        results = asyncio.run(extract_all_components(transcript))
 
-        print("- Extracting traits...")
-        try:
-            traits = extract_traits(transcript)
-            print(f"Found {len(traits)} traits")
-        except Exception as e:
-            print(f"Failed to extract traits: {e}")
-            traits = []
+        # Debug logging
+        print("\nProcessing results:")
+        for key, value in results.items():
+            print(f"{key}: {type(value)}")
+            if isinstance(value, dict):
+                print(f"Keys: {value.keys()}")
 
-        print("- Extracting beliefs...")
-        try:
-            beliefs = extract_beliefs(transcript)
-            print(f"Found {len(beliefs)} beliefs")
-        except Exception as e:
-            print(f"Failed to extract beliefs: {e}")
-            beliefs = []
+        # Process all results
+        traits = [Trait(**t) for t in results.get("traits", {}).get("traits", [])]
+        print(f"Processed {len(traits)} traits")
 
-        print("- Extracting philosophies...")
-        try:
-            philosophies = extract_philosophies(transcript)
-            print(f"Found {len(philosophies)} philosophies")
-        except Exception as e:
-            print(f"Failed to extract philosophies: {e}")
-            philosophies = []
+        beliefs = [Belief(**b) for b in results.get("beliefs", {}).get("beliefs", [])]
+        print(f"Processed {len(beliefs)} beliefs")
 
-        print("- Extracting failures...")
-        try:
-            failures = extract_failures(transcript)
-            print(f"Found {len(failures)} failures")
-        except Exception as e:
-            print(f"Failed to extract failures: {e}")
-            failures = []
+        philosophies = [Philosophy(**p) for p in results.get("philosophies", {}).get("philosophies", [])]
+        print(f"Processed {len(philosophies)} philosophies")
 
-        print("- Extracting key decisions...")
-        try:
-            key_decisions = extract_key_decisions(transcript)
-            print(f"Found {len(key_decisions)} key decisions")
-        except Exception as e:
-            print(f"Failed to extract key decisions: {e}")
-            key_decisions = []
+        failures = [Failure(**f) for f in results.get("failures", {}).get("failures", [])]
+        print(f"Processed {len(failures)} failures")
 
-        print("- Extracting mentors and network...")
-        try:
-            mentors_and_network = extract_mentors_and_network(transcript)
-            print(f"Found {len(mentors_and_network)} mentors and network connections")
-        except Exception as e:
-            print(f"Failed to extract mentors and network: {e}")
-            mentors_and_network = []
+        key_decisions = [KeyDecision(**k) for k in results.get("key_decisions", {}).get("key_decisions", [])]
+        print(f"Processed {len(key_decisions)} key decisions")
 
-        print("- Extracting habits...")
-        try:
-            habits = extract_habits(transcript)
-            print(f"Found {len(habits)} habits")
-        except Exception as e:
-            print(f"Failed to extract habits: {e}")
-            habits = []
+        mentors = [Connection(**m) for m in results.get("mentors", {}).get("connections", [])]
+        print(f"Processed {len(mentors)} mentors")
 
-        print("- Extracting unique approaches...")
-        try:
-            unique_approaches = extract_unique_approaches(transcript)
-            print(f"Found {len(unique_approaches)} unique approaches")
-        except Exception as e:
-            print(f"Failed to extract unique approaches: {e}")
-            unique_approaches = []
+        habits = [Habit(**h) for h in results.get("habits", {}).get("habits", [])]
+        print(f"Processed {len(habits)} habits")
 
-        print("- Extracting anecdotes...")
-        try:
-            anecdotes = extract_anecdotes(transcript)
-            print(f"Found {len(anecdotes)} anecdotes")
-        except Exception as e:
-            print(f"Failed to extract anecdotes: {e}")
-            anecdotes = []
+        approaches = [UniqueApproach(**a) for a in results.get("approaches", {}).get("approaches", [])]
+        print(f"Processed {len(approaches)} unique approaches")
 
-        print("- Extracting emotional intelligence...")
-        try:
-            emotional_intelligence = extract_emotional_intelligence(transcript)
-            print("Found emotional intelligence aspects")
-        except Exception as e:
-            print(f"Failed to extract emotional intelligence: {e}")
-            emotional_intelligence = EmotionalIntelligence(
-                stress_management=[],
-                leadership_style=[],
-                source="",
-                confidence=0.0,
-                data_type=DataType.FACTUAL
-            )
+        anecdotes = [Anecdote(**a) for a in results.get("anecdotes", {}).get("anecdotes", [])]
+        print(f"Processed {len(anecdotes)} anecdotes")
 
-        print("\nBuilding final Founder object...")
-        founder = Founder(
+        # Process emotional intelligence
+        ei_data = results.get("emotional_intelligence", {}).get("emotional_intelligence", {})
+        emotional_intelligence = EmotionalIntelligence(
+            stress_management=[StressStrategy(**s) for s in ei_data.get("stress_management", [])],
+            leadership_style=[LeadershipTrait(**l) for l in ei_data.get("leadership_style", [])],
+            source=ei_data.get("source", ""),
+            confidence=ei_data.get("confidence", 0.0),
+            data_type=DataType[ei_data.get("data_type", "FACTUAL")]
+        )
+
+        return Founder(
             basic_info=basic_info,
-            early_life=[],
+            early_life=[],  # Not implemented yet
             timeline=timeline,
             traits=traits,
             beliefs=beliefs,
             philosophies=philosophies,
             failures=failures,
             key_decisions=key_decisions,
-            mentors_and_network=mentors_and_network,
+            mentors_and_network=mentors,
             habits=habits,
-            unique_approaches=unique_approaches,
+            unique_approaches=approaches,
             anecdotes=anecdotes,
             emotional_intelligence=emotional_intelligence,
             metadata=Metadata(
@@ -1054,9 +1043,8 @@ def extract_founder_data(transcript: str) -> Founder:
             )
         )
 
-        print("\n=== Extraction Complete ===")
-        return founder
-
     except Exception as e:
         print(f"\nError in extract_founder_data: {e}")
+        if results:  # Only print results if they exist
+            print("Results:", results)
         raise
